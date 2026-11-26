@@ -1,0 +1,221 @@
+name: CI / CD
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # JOB 0 : Quality checks
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install dev dependencies
+        run: uv sync --locked --group dev
+
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+
+  # JOB 1 : Unit tests
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install dev dependencies
+        run: uv sync --locked --group dev
+
+      - name: Run tests and generate coverage
+        run: |
+          uv run pytest \
+            --cov=src/jaquette \
+            --cov-report=term-missing \
+            --cov-report=html:htmlcov \
+            --cov-report=xml:coverage.xml \
+            --junitxml=pytest-results.xml
+
+      - name: Upload HTML coverage report
+        if: |
+          always() &&
+          (
+            github.ref == 'refs/heads/main' ||
+            (github.event_name == 'pull_request' && github.base_ref == 'main')
+          )
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage-report
+          path: htmlcov/
+
+      - name: Upload test results
+        if: |
+          always() &&
+          (
+            github.ref == 'refs/heads/main' ||
+            (github.event_name == 'pull_request' && github.base_ref == 'main')
+          )
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results
+          path: pytest-results.xml
+
+      - name: Add test summary
+        if: always()
+        run: |
+          if [ -f pytest-results.xml ]; then
+            python - <<'PY'
+          import xml.etree.ElementTree as ET
+          import os
+
+          root = ET.parse("pytest-results.xml").getroot()
+
+          if root.tag == "testsuites":
+              suites = root.findall("testsuite")
+          else:
+              suites = [root]
+
+          total = sum(int(suite.get("tests", 0)) for suite in suites)
+          failures = sum(int(suite.get("failures", 0)) for suite in suites)
+          errors = sum(int(suite.get("errors", 0)) for suite in suites)
+          skipped = sum(int(suite.get("skipped", 0)) for suite in suites)
+          passed = total - failures - errors - skipped
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("## Résultats des tests\n\n")
+              f.write(f"- Réussis : {passed}\n")
+              f.write(f"- Échoués : {failures}\n")
+              f.write(f"- Erreurs : {errors}\n")
+              f.write(f"- Ignorés : {skipped}\n")
+              f.write(f"- Total : {total}\n")
+          PY
+          fi
+
+      - name: Add coverage summary
+        if: always()
+        run: |
+          if [ -f coverage.xml ]; then
+            python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("coverage.xml").getroot()
+          rate = float(root.attrib["line-rate"]) * 100
+
+          with open(
+              __import__("os").environ["GITHUB_STEP_SUMMARY"],
+              "a"
+          ) as f:
+              f.write(f"## Couverture de code : {rate:.2f}%\n")
+          PY
+          fi
+
+  # JOB 2 : Verify that the version tag points to a commit in main
+  verify-tag:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag commit belongs to main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD
+
+  # JOB 3 : Build and deploy GitHub Pages documentation
+  build-docs:
+    runs-on: ubuntu-latest
+    needs: [lint, tests, verify-tag]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install docs dependencies
+        run: uv sync --locked --only-group docs
+
+      - name: Build documentation
+        run: uv run zensical build --clean
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy-docs:
+    runs-on: ubuntu-latest
+    needs: build-docs
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v5
+        id: deployment
+
+  # JOB 4 : Build and publish the Python package
+  build-package:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/jaquette
+    needs: [lint, tests, verify-tag]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Verify package version matches Git tag
+        run: |
+          VERSION=$(uv version --short)
+          TAG="${GITHUB_REF_NAME#v}"
+
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "Version mismatch!"
+            echo "pyproject.toml: $VERSION"
+            echo "Git tag: $TAG"
+            exit 1
+          fi
+
+      - name: Build package
+        run: uv build --no-sources
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist-packages
+          path: dist/
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always
